@@ -4,7 +4,10 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build:native": "swiftc -swift-version 5 -emit-library -O -o native/libvision.dylib native/vision.swift && codesign -s - -f native/libvision.dylib && swiftc -swift-version 5 -O -o native/vision-tts native/tts.swift",
+    "build:native": "bun scripts/build-native.ts",
+    "migrate": "bun src/migrate.ts",
+    "db:up": "docker compose up -d --wait",
+    "db:down": "docker compose down",
     "dev": "bun run build:native && bun --watch src/index.ts",
     "start": "bun src/index.ts",
     "test": "bun test"
@@ -13,6 +16,7 @@
     "@elysiajs/openapi": "^1.4.16",
     "@scalar/api-reference": "^1.74.0",
     "elysia": "^1.4.30",
+    "kysely": "^0.29.6",
     "pg": "^8.23.1",
     "pgque": "^0.2.2"
   }

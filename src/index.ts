@@ -1,8 +1,10 @@
 import { Elysia, t } from "elysia";
 import { call } from "./native";
+import { nativeAvailable, nativeError } from "./platform";
 import { checkVoice, voices } from "./tts";
 import { enqueue, findFile, getJob, listFiles, listJobs } from "./queue";
 import { openapi } from "@elysiajs/openapi";
+import { fileURLToPath } from "node:url";
 import pkg from "../package.json";
 
 const textOpts = t.Object({
@@ -25,7 +27,7 @@ const accepted = { 202: t.Object({ id: t.String({ format: "uuid" }), status: t.L
 const d = (tag: string, summary: string, description?: string) => ({ detail: { tags: [tag], summary, description } });
 const imageBody = t.Object({ file: t.File({ type: "image/*" }) });
 
-const SCALAR_JS = new URL("../node_modules/@scalar/api-reference/dist/browser/standalone.js", import.meta.url).pathname;
+const SCALAR_JS = fileURLToPath(new URL("../node_modules/@scalar/api-reference/dist/browser/standalone.js", import.meta.url));
 
 const app = new Elysia()
   .use(openapi({
@@ -61,10 +63,13 @@ const app = new Elysia()
   .get("/docs/scalar.js", () => new Response(Bun.file(SCALAR_JS), { headers: { "content-type": "text/javascript", "cache-control": "public, max-age=86400" } }), { detail: { hide: true } })
   .get("/", async () => {
     const v = await call("version");
-    return { name: pkg.name, version: pkg.version, bun: Bun.version, ...v.result };
-  }, d("System", "Versions", "App, Bun, macOS and Vision framework versions."))
+    return { name: pkg.name, version: pkg.version, bun: Bun.version, platform: process.platform, native: { available: nativeAvailable, error: nativeError }, ...v.result };
+  }, d("System", "Versions", "App, Bun, macOS and Vision framework versions. `native.available` is false off macOS: the queue and docs work but processing jobs fail."))
   .get("/health", () => ({ ok: true }), d("System", "Health check"))
-  .get("/capabilities", () => call("capabilities"), d("System", "Capabilities", "OS version and supported OCR languages."))
+  .get("/capabilities", async ({ status }) => {
+    const r = await call("capabilities");
+    return r.ok ? r : status(501, r);
+  }, d("System", "Capabilities", "OS version and supported OCR languages."))
   .post("/ocr/text", async ({ body, query, status }) =>
     status(202, await submit("ocr", [body.file], toOpts(query))), { body: imageBody, query: textOpts, response: accepted, ...d("OCR", "Recognize text", "`fast` is quicker but does not read Thai; use `accurate` (default) for Thai. `lang` is a comma list such as `th-TH,en-US`.") })
   .post("/ocr/document", async ({ body, query, status }) =>
@@ -83,7 +88,7 @@ const app = new Elysia()
   .post("/detect/barcode", async ({ body, status }) => status(202, await submit("barcode", [body.file])), { body: imageBody, response: accepted, ...d("Detect", "Read barcodes and QR codes") })
   .post("/image/similarity", async ({ body, status }) => status(202, await submit("similarity", [body.a, body.b])),
     { body: t.Object({ a: t.File({ type: "image/*" }), b: t.File({ type: "image/*" }) }), response: accepted, ...d("Image", "Compare two images", "Feature-print distance: 0 means identical, larger means less similar.") })
-  .get("/voices", () => voices(), d("System", "List TTS voices", "Voices installed on this Mac. Pass `name` (or its short form, e.g. `Kanya`) as `voice` to POST /tts."))
+  .get("/voices", async ({ status }) => nativeAvailable ? voices() : status(501, { ok: false, error: nativeError }), d("System", "List TTS voices", "Voices installed on this Mac. Pass `name` (or its short form, e.g. `Kanya`) as `voice` to POST /tts."))
   .post("/tts", async ({ body, status }) => {
     const bad = await checkVoice(body);
     if (bad) return status(422, { ok: false, error: bad });

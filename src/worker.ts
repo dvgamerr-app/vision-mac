@@ -1,6 +1,7 @@
 import { dlopen, FFIType, ptr, CString } from "bun:ffi";
+import { LIB_PATH } from "./platform";
 
-const lib = dlopen(new URL("../native/libvision.dylib", import.meta.url).pathname, {
+const lib = dlopen(LIB_PATH, {
   vision_free: { args: [FFIType.ptr], returns: FFIType.void },
   vision_version: { args: [], returns: FFIType.ptr },
   vision_run: { args: [FFIType.cstring, FFIType.ptr, FFIType.u64, FFIType.cstring], returns: FFIType.ptr },

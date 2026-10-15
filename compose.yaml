@@ -1,0 +1,23 @@
+# Local Postgres for development and tests. vision-mac itself runs on the host (`bun run dev`): Vision is macOS-only, so it cannot be a container.
+#   bun run db:up        # start (waits until healthy)
+#   bun run db:down      # stop; add -v to also drop the data
+# Migrations (pgque, queue, tables) are applied automatically when the app starts, or with `bun run migrate`.
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: vision
+      POSTGRES_PASSWORD: vision
+      POSTGRES_DB: vision
+    ports:
+      - "${PG_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vision -d vision"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  pgdata:

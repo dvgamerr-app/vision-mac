@@ -1,4 +1,7 @@
 import { connect } from "pgque";
+import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
+import { migrate } from "./migrate";
 import { mkdir, rm, readFile, writeFile, rmdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { call } from "./native";
@@ -7,8 +10,8 @@ import { synthesize, type TtsOpts } from "./tts";
 // Jobs: pgque carries the event (job id), `vision_jobs` holds input paths + result. See docs/vision-mac-queue.md.
 const QUEUE = "vision";
 const CONSUMER = "vision-worker";
-const JOBS_DIR = process.env.JOBS_DIR ?? "/tmp/vision-mac-jobs";
-export const STORAGE_DIR = resolve(process.env.STORAGE_DIR ?? new URL("../storage", import.meta.url).pathname);
+const JOBS_DIR = process.env.JOBS_DIR ?? join(tmpdir(), "vision-mac-jobs");
+export const STORAGE_DIR = resolve(process.env.STORAGE_DIR ?? fileURLToPath(new URL("../storage", import.meta.url)));
 const FILE_TTL_HOURS = Number(process.env.FILE_TTL_HOURS ?? 6);
 const RETENTION_HOURS = Number(process.env.RETENTION_HOURS ?? 24);
 const STUCK_MINUTES = Number(process.env.STUCK_MINUTES ?? 10);
@@ -16,6 +19,7 @@ const STUCK_MINUTES = Number(process.env.STUCK_MINUTES ?? 10);
 if (!process.env.DATABASE_URL) throw new Error("DATABASE_URL is required (see .env.example)");
 const client = await connect(process.env.DATABASE_URL);
 const db = client.rawPool;
+if (process.env.AUTO_MIGRATE !== "false") await migrate(db); // pgque, queue and tables (src/migrations); `bun run migrate` does the same by hand
 await mkdir(JOBS_DIR, { recursive: true });
 await mkdir(STORAGE_DIR, { recursive: true });
 

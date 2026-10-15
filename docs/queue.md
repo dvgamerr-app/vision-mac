@@ -13,7 +13,7 @@ client ─POST /ocr/text─► Elysia ─┬─ insert vision_jobs (status=queue
 ```
 
 - **pgque** ([NikolayS/pgque](https://github.com/NikolayS/pgque), Apache-2.0, PgQ แบบ pure SQL) เก็บแค่ event `{id}` ส่วนผลลัพธ์อยู่ในตาราง `vision_jobs`
-- ติดตั้งแบบ pure SQL ไม่ใช้ extension (ไฟล์ vendor ไว้ที่ `vision-mac/db/pgque.sql` จาก commit `4a52258`, license ที่ `db/pgque.LICENSE`)
+- ติดตั้งแบบ pure SQL ไม่ใช้ extension (ไฟล์ vendor ไว้ที่ `db/pgque.sql` จาก commit `4a52258`, license ที่ `db/pgque.LICENSE`)
 - **ไม่มี pg_cron** ใน `postgres:18-alpine` ตัว server เลยเรียก `pgque.ticker()` ทุก 1 วินาที และ `pgque.maint()` ทุก 30 วินาทีเอง ห้ามรันหลาย instance พร้อมกัน
 
 ## ฐานข้อมูล
@@ -23,17 +23,33 @@ client ─POST /ocr/text─► Elysia ─┬─ insert vision_jobs (status=queue
 | Container | `postgres` (published `5432` บน host) |
 | Database | `vision` (เดิมชื่อ `queue` เปลี่ยนชื่อแล้ว; pgque อยู่ใน schema `pgque`, ตารางงานอยู่ใน `public`) |
 | Queue / consumer | `vision` / `vision-worker` |
-| ตาราง | `public.vision_jobs` (งาน/ผล JSON) และ `public.vision_files` (ไฟล์ผลลัพธ์) — `db/schema.sql` |
+| ตาราง | `public.vision_jobs` (งาน/ผล JSON) และ `public.vision_files` (ไฟล์ผลลัพธ์) — `src/migrations/003_jobs.ts` |
 | Connection | `DATABASE_URL` ใน `vision-mac/.env` (gitignore, แม่แบบ `.env.example`) |
 
-ติดตั้งใหม่ตั้งแต่ศูนย์ (ต้องใช้ `db/schema.sql` ทั้งไฟล์ ซึ่งมีทั้ง `vision_jobs` และ `vision_files`):
+### Migration (Kysely)
+
+schema ทั้งหมดจัดการด้วย Kysely migration ใน `src/migrations/` (ลงทะเบียนใน `src/migrate.ts`):
+
+| Migration | ทำอะไร |
+|---|---|
+| `001_pgque` | ติดตั้ง pgque จาก `db/pgque.sql` (ข้ามถ้ามี `pgque.queue` อยู่แล้ว) |
+| `002_queue` | `create_queue('vision')` + `subscribe('vision','vision-worker')` |
+| `003_jobs` | ตาราง `vision_jobs`, `vision_files` + index |
+
+- รันอัตโนมัติตอน server start (`AUTO_MIGRATE=false` เพื่อปิด) หรือด้วยมือ `bun run migrate [up|down|status]`
+- ทุกขั้น idempotent จึงใช้กับ DB ที่ติดตั้งด้วยมือมาก่อนได้ (Kysely แค่จดประวัติใน `kysely_migration`)
+- เพิ่ม migration ใหม่: สร้างไฟล์ `00N_ชื่อ.ts` ที่ export `up`/`down` แล้วเพิ่มต่อท้ายใน `src/migrate.ts`
+- ต้องสร้าง database เปล่าก่อนเอง (`create database vision`) หรือใช้ `compose.yaml` ที่สร้างให้แล้ว
+
+### รัน local เพื่อทดสอบ
 
 ```sh
-container exec postgres psql -U r00t -d postgres -c "create database vision"
-container exec -i postgres psql -U r00t -d vision -v ON_ERROR_STOP=1 --single-transaction < db/pgque.sql
-container exec postgres psql -U r00t -d vision -c "select pgque.create_queue('vision')" -c "select pgque.subscribe('vision','vision-worker')"
-container exec -i postgres psql -U r00t -d vision -v ON_ERROR_STOP=1 < db/schema.sql
+bun run db:up      # docker compose: postgres:18-alpine, user/password/db = vision, port ${PG_PORT:-5432}
+bun run dev        # build native (เฉพาะ macOS) + รัน server
+bun run db:down    # หยุด (เพิ่ม -v เพื่อลบข้อมูล)
 ```
+
+`compose.yaml` มีแค่ Postgres เพราะ Vision รันใน container ไม่ได้ บนเครื่องที่ไม่ใช่ macOS (Windows/Linux) แอปยังรันได้ ทดสอบ DB/queue/job/ไฟล์/docs ได้ครบ แต่ job ที่ประมวลผลจะ `failed` พร้อม error `Vision and AVSpeechSynthesizer need macOS` (เช็คใน `src/platform.ts`; `GET /` แสดง `native.available`, `/voices` กับ `/capabilities` ตอบ `501`)
 
 ## API
 

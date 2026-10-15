@@ -5,9 +5,15 @@ Runs on the host only (Vision does not exist in Linux containers). LAN: `http://
 
 ```sh
 bun install
-bun run build:native   # swiftc → native/libvision.dylib (ad-hoc signed)
-bun run start          # PORT=8090 WORKERS=2
+cp .env.example .env   # DATABASE_URL, matches compose.yaml
+bun run db:up          # local Postgres 18 via docker compose (or point DATABASE_URL at your own)
+bun run build:native   # swiftc → native/libvision.dylib + native/vision-tts (macOS only; skipped elsewhere)
+bun run start          # PORT=8090 WORKERS=2; applies migrations on start
 ```
+
+**Migrations** use [Kysely](https://kysely.dev) (`src/migrations/`): pgque install → queue `vision` → tables `vision_jobs`/`vision_files`. They run automatically on start (`AUTO_MIGRATE=false` to turn off) or by hand: `bun run migrate [up|down|status]`. They are idempotent, so a database set up by hand before migrations existed is adopted as-is.
+
+**Not on macOS** (Windows/Linux dev machines): the app still starts. DB, migrations, queue, job/file routes and `/docs` all work, so you can develop and test them; `GET /` shows `native.available: false` with the reason, `/voices` and `/capabilities` answer `501`, and every processing job (OCR, TTS, ...) ends `failed` with `Vision and AVSpeechSynthesizer need macOS`. Same if the dylib was never built.
 
 Service: `~/Library/LaunchAgents/app.dvgamerr.vision-mac.plist` (log: `/tmp/vision-mac.log`).
 After changing Swift: `bun run build:native && launchctl kickstart -k gui/$(id -u)/app.dvgamerr.vision-mac`
@@ -34,6 +40,6 @@ After changing Swift: `bun run build:native && launchctl kickstart -k gui/$(id -
 | `GET /jobs/:id`, `GET /jobs` | | job status/result; `?wait=ms` long-polls |
 | `GET /jobs/:id/files`, `GET /jobs/:id/files/:name` | | output files (images, later audio/video); stored in `storage/`, TTL 6 h after the job finishes (`FILE_TTL_HOURS`), `410` when expired |
 
-**All processing routes are async**: they return `202 {id, status, url}`; fetch the result with `GET /jobs/:id?wait=20000` (see `docs/queue.md`). Needs `DATABASE_URL` in `.env` (db `vision`, pgque installed from `db/`).
+**All processing routes are async**: they return `202 {id, status, url}`; fetch the result with `GET /jobs/:id?wait=20000` (see `../docs/vision-mac-queue.md`). Needs `DATABASE_URL` in `.env` (db `vision`, pgque installed from `db/`).
 
 Boxes are normalized 0–1, origin bottom-left. Example: `fetch(url, { method: "POST", body: formData })` with field `file`.

@@ -1,10 +1,10 @@
 import { mkdir, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { call } from "./native";
+import { nativeAvailable, nativeError, TTS_BIN } from "./platform";
 
 // TTS is AVSpeechSynthesizer.write → AVAudioFile in native/tts.swift, run as a child process per job: the synthesizer delivers
 // its buffers on the main thread, so it needs a main run loop that neither Bun's main thread nor its Workers have.
-const TTS_BIN = new URL("../native/vision-tts", import.meta.url).pathname;
 export type Voice = { identifier: string; name: string; language: string; quality: string; gender: string; personal: boolean; novelty: boolean };
 export type TtsOpts = {
   text: string; ssml?: boolean; voice?: string; language?: string;
@@ -21,6 +21,7 @@ export async function voices(): Promise<Voice[]> {
 
 /** null when the requested voice or language has no match on this Mac (so the route can answer 422). */
 export async function checkVoice(o: { voice?: string; language?: string }): Promise<string | null> {
+  if (!nativeAvailable) return null; // cannot validate here; the job itself fails with the reason
   const all = await voices();
   if (o.voice && !all.some((v) => v.identifier === o.voice || v.name.toLowerCase() === o.voice!.toLowerCase())) return `unknown voice: ${o.voice}`;
   if (!o.voice && o.language && !all.some((v) => v.language.replace("_", "-") === o.language)) return `no voice for language: ${o.language}`;
@@ -28,6 +29,7 @@ export async function checkVoice(o: { voice?: string; language?: string }): Prom
 }
 
 export async function synthesize(dir: string, o: TtsOpts) {
+  if (!nativeAvailable) throw new Error(nativeError!);
   await mkdir(dir, { recursive: true });
   const ext = o.format === "m4a" ? "m4a" : "wav";
   const out = join(dir, `speech.${ext}`);
