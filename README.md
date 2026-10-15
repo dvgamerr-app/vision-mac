@@ -34,6 +34,6 @@ After changing Swift: `bun run build:native && launchctl kickstart -k gui/$(id -
 | `GET /jobs/:id`, `GET /jobs` | | job status/result; `?wait=ms` long-polls |
 | `GET /jobs/:id/files`, `GET /jobs/:id/files/:name` | | output files (images, later audio/video); stored in `storage/`, TTL 6 h after the job finishes (`FILE_TTL_HOURS`), `410` when expired |
 
-**All processing routes are async**: they return `202 {id, status, url}`; fetch the result with `GET /jobs/:id?wait=20000` (see `../docs/vision-mac-queue.md`). Needs `DATABASE_URL` in `.env` (db `vision`, pgque installed from `db/`).
+**All processing routes are async**: they return `202 {id, status, url}`; fetch the result with `GET /jobs/:id?wait=20000` (see `docs/queue.md`). Needs `DATABASE_URL` in `.env` (db `vision`, pgque installed from `db/`).
 
 Boxes are normalized 0–1, origin bottom-left. Example: `fetch(url, { method: "POST", body: formData })` with field `file`.
