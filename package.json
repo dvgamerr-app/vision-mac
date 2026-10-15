@@ -1,0 +1,19 @@
+{
+  "name": "vision-mac",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:native": "swiftc -swift-version 5 -emit-library -O -o native/libvision.dylib native/vision.swift && codesign -s - -f native/libvision.dylib && swiftc -swift-version 5 -O -o native/vision-tts native/tts.swift",
+    "dev": "bun run build:native && bun --watch src/index.ts",
+    "start": "bun src/index.ts",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@elysiajs/openapi": "^1.4.16",
+    "@scalar/api-reference": "^1.74.0",
+    "elysia": "^1.4.30",
+    "pg": "^8.23.1",
+    "pgque": "^0.2.2"
+  }
+}

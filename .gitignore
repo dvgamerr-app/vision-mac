@@ -1,0 +1,5 @@
+node_modules
+native/libvision.dylib
+.env
+storage
+native/vision-tts
