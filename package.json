@@ -19,5 +19,8 @@
     "kysely": "^0.29.6",
     "pg": "^8.23.1",
     "pgque": "^0.2.2"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
   }
 }

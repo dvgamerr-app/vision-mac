@@ -7,7 +7,7 @@ import { join, resolve } from "node:path";
 import { call } from "./native";
 import { synthesize, type TtsOpts } from "./tts";
 
-// Jobs: pgque carries the event (job id), `vision_jobs` holds input paths + result. See docs/vision-mac-queue.md.
+// Jobs: pgque carries the event (job id), `vision_jobs` holds input paths + result. See docs/queue.md.
 const QUEUE = "vision";
 const CONSUMER = "vision-worker";
 const JOBS_DIR = process.env.JOBS_DIR ?? join(tmpdir(), "vision-mac-jobs");
@@ -23,15 +23,35 @@ if (process.env.AUTO_MIGRATE !== "false") await migrate(db); // pgque, queue and
 await mkdir(JOBS_DIR, { recursive: true });
 await mkdir(STORAGE_DIR, { recursive: true });
 
+// pgque.ticker() must never run in parallel: its snapshot is taken before any lock (pgque.sql:1284), so two overlapping
+// ticks can put the same events in two batches. Every tick in this process goes through this one chain.
+let ticking: Promise<unknown> = Promise.resolve();
+const tick = (label: string, fn: () => Promise<unknown>) =>
+  (ticking = ticking.then(fn).catch((e) => console.error(`${label}:`, (e as Error).message)));
+
 export async function enqueue(op: string, files: Uint8Array[], opts: unknown = {}) {
   const id = crypto.randomUUID();
   const dir = join(JOBS_DIR, id);
   await mkdir(dir, { recursive: true });
-  const paths = await Promise.all(files.map(async (f, i) => { const p = join(dir, String(i)); await writeFile(p, f); return p; }));
-  await db.query("insert into vision_jobs (id, op, opts, files) values ($1, $2, $3, $4)", [id, op, JSON.stringify(opts), paths]);
-  await client.send(QUEUE, { type: "job", payload: { id } });
+  try {
+    const paths = await Promise.all(files.map(async (f, i) => { const p = join(dir, String(i)); await writeFile(p, f); return p; }));
+    // row and event commit together: a failed send leaves no orphan 'queued' row behind
+    const c = await db.connect();
+    try {
+      await c.query("begin");
+      await c.query("insert into vision_jobs (id, op, opts, files) values ($1, $2, $3, $4)", [id, op, JSON.stringify(opts), paths]);
+      await c.query("select pgque.send($1, $2, $3::jsonb)", [QUEUE, "job", JSON.stringify({ id })]);
+      await c.query("commit");
+    } catch (e) {
+      await c.query("rollback").catch(() => {});
+      throw e;
+    } finally { c.release(); }
+  } catch (e) {
+    await rm(dir, { recursive: true, force: true });
+    throw e;
+  }
   // low latency: cut a tick now instead of waiting for the 1s timer (send/tick/receive must be separate txns)
-  client.forceNextTick(QUEUE).then(() => client.ticker(QUEUE)).catch(() => {});
+  tick("tick", () => client.forceNextTick(QUEUE).then(() => client.ticker(QUEUE)));
   return id;
 }
 
@@ -104,6 +124,7 @@ async function sweepFiles() {
   return rows.length;
 }
 
+export const MAX_LIST = 200;
 export async function listJobs(status?: string, limit = 50) {
   const { rows } = await db.query(
     `select ${COLS} from vision_jobs where ($1::text is null or status = $1) order by created_at desc limit $2`, [status ?? null, limit]);
@@ -111,8 +132,10 @@ export async function listJobs(status?: string, limit = 50) {
 }
 
 async function finish(id: string, status: "done" | "failed", result: unknown, error?: string) {
-  await db.query("update vision_jobs set status = $2, result = $3, error = $4, finished_at = now() where id = $1",
+  // only a running job: one the stuck sweeper already failed stays failed (no failed → done flip seen by pollers)
+  await db.query("update vision_jobs set status = $2, result = $3, error = $4, finished_at = now() where id = $1 and status = 'running'",
     [id, status, result === undefined ? null : JSON.stringify(result), error ?? null]);
+  // output files get their TTL either way, otherwise the file sweeper would never remove them
   await db.query("update vision_files set expires_at = now() + make_interval(hours => $2) where job_id = $1 and deleted_at is null", [id, FILE_TTL_HOURS]);
   await rm(join(JOBS_DIR, id), { recursive: true, force: true });
 }
@@ -122,7 +145,10 @@ consumer.handle("job", async (msg) => {
   const { id } = JSON.parse(msg.payload) as { id: string };
   const { rows } = await db.query(
     "update vision_jobs set status = 'running', attempts = attempts + 1, started_at = now() where id = $1 and status in ('queued', 'running') returning op, opts, files", [id]);
-  if (!rows[0]) return; // finished, expired or deleted: ack and move on
+  if (!rows[0]) { // finished, expired or deleted: drop any inputs still on disk, ack and move on
+    await rm(join(JOBS_DIR, id), { recursive: true, force: true });
+    return;
+  }
   const { op, opts, files } = rows[0] as { op: string; opts: unknown; files: string[] };
   if (op === "tts") { // no input file: synthesize, store the audio as an output file
     try {
@@ -145,11 +171,27 @@ const ac = new AbortController();
 consumer.start(ac.signal).catch((e) => console.error("consumer stopped:", e));
 
 // no pg_cron in the postgres container → drive the ticker and maintenance from here
-setInterval(() => client.tickerAll().catch((e) => console.error("ticker:", e.message)), 1000);
+let timerTick = false; // at most one timer tick waiting in the chain, so a slow DB cannot pile them up
+setInterval(() => {
+  if (timerTick) return;
+  timerTick = true;
+  tick("ticker", () => client.tickerAll()).finally(() => { timerTick = false; });
+}, 1000);
 setInterval(async () => {
   try {
     await db.query("select pgque.maint()");
-    await db.query("update vision_jobs set status = 'failed', error = 'stuck: no result', finished_at = now() where status in ('queued','running') and created_at < now() - make_interval(mins => $1)", [STUCK_MINUTES]);
+    // maint() leaves out retries and rotation step 2 (pgque.start() schedules those through pg_cron, which this setup has not).
+    // Each runs as its own statement, so in its own transaction, as pgque requires.
+    for (let i = 0; i < 100 && (await db.query("select pgque.maint_retry_events() as n")).rows[0].n > 0; i++);
+    await db.query("select pgque.maint_rotate_tables_step2()");
+    // stuck = running too long (by started_at, so a long backlog is not failed while it waits); a 'queued' row is only an
+    // orphan once it is older than the retention window. Their inputs go too.
+    const { rows: stuck } = await db.query(
+      `update vision_jobs set status = 'failed', error = 'stuck: no result', finished_at = now()
+        where (status = 'running' and started_at < now() - make_interval(mins => $1))
+           or (status = 'queued' and created_at < now() - make_interval(hours => $2))
+        returning id`, [STUCK_MINUTES, RETENTION_HOURS]);
+    for (const { id } of stuck) await rm(join(JOBS_DIR, id), { recursive: true, force: true });
     await sweepFiles();
     // keep the job row until its files are gone, so a late download answers 410 rather than 404
     await db.query("delete from vision_jobs j where finished_at < now() - make_interval(hours => $1) and not exists (select 1 from vision_files f where f.job_id = j.id and f.deleted_at is null)", [RETENTION_HOURS]);

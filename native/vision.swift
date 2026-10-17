@@ -84,6 +84,8 @@ public func vision_pdf(_ bytes: UnsafePointer<UInt8>?, _ len: Int, _ optsJSON: U
     guard let bytes, len > 0, let doc = PDFDocument(data: Data(bytes: bytes, count: len)) else { return fail("cannot read pdf") }
     let opts = parseOpts(optsJSON)
     let scale = CGFloat((opts["scale"] as? Double) ?? 2)
+    // each page is one RGBA bitmap of (size * scale)^2: cap it so a big scale cannot ask for gigabytes per page
+    guard scale > 0, scale <= 8 else { return fail("scale must be > 0 and <= 8") }
     let wanted = Set((opts["pages"] as? [Int]) ?? Array(1...max(doc.pageCount, 1)))
     let start = Date()
     var pages: [[String: Any]] = []
@@ -92,7 +94,8 @@ public func vision_pdf(_ bytes: UnsafePointer<UInt8>?, _ len: Int, _ optsJSON: U
         let r = page.bounds(for: .mediaBox)
         let w = Int(r.width * scale), h = Int(r.height * scale)
         guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
-                                  space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { continue }
+                                  space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { pages.append(["page": i + 1, "error": "cannot allocate a \(w)x\(h) bitmap"]); continue }
         ctx.setFillColor(CGColor(gray: 1, alpha: 1)); ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
         ctx.scaleBy(x: scale, y: scale)
         page.draw(with: .mediaBox, to: ctx)
@@ -210,13 +213,21 @@ private func run(_ op: String, _ image: CGImage, _ opts: [String: Any]) throws -
     switch op {
     case "face":
         let lm = VNDetectFaceLandmarksRequest()
-        let q = VNDetectFaceCaptureQualityRequest()
-        try handler.perform([lm, q])
-        let quality = (q.results ?? []).map { $0.faceCaptureQuality as Any? }
-        let faces: [[String: Any]] = (lm.results ?? []).enumerated().map { (i, f) in
+        try handler.perform([lm])
+        let found = lm.results ?? []
+        // score the faces landmarks found (not a second, independently ordered detection), then pair them by box
+        var scored: [VNFaceObservation] = []
+        if !found.isEmpty {
+            let q = VNDetectFaceCaptureQualityRequest(); q.inputFaceObservations = found
+            try handler.perform([q])
+            scored = q.results ?? []
+        }
+        let gap = { (a: CGRect, b: CGRect) in abs(a.minX - b.minX) + abs(a.minY - b.minY) + abs(a.width - b.width) + abs(a.height - b.height) }
+        let faces: [[String: Any]] = found.map { f in
             var d: [String: Any] = ["box": box(f.boundingBox), "confidence": f.confidence]
             if let r = f.roll { d["roll"] = r }; if let y = f.yaw { d["yaw"] = y }; if let p = f.pitch { d["pitch"] = p }
-            if i < quality.count, let cq = quality[i] { d["captureQuality"] = cq }
+            let match = scored.first { $0.uuid == f.uuid } ?? scored.min { gap($0.boundingBox, f.boundingBox) < gap($1.boundingBox, f.boundingBox) }
+            if let cq = match?.faceCaptureQuality { d["captureQuality"] = cq }
             if let l = f.landmarks { // points are relative to the face box
                 var regions: [String: Any] = [:]
                 let all: [(String, VNFaceLandmarkRegion2D?)] = [("leftEye", l.leftEye), ("rightEye", l.rightEye), ("leftEyebrow", l.leftEyebrow),
@@ -239,7 +250,7 @@ private func run(_ op: String, _ image: CGImage, _ opts: [String: Any]) throws -
         return ["bodies": try (r.results ?? []).map { ["joints": poseJSON(try $0.recognizedPoints(.all), minConf), "confidence": $0.confidence] }]
 
     case "hand":
-        let r = VNDetectHumanHandPoseRequest(); r.maximumHandCount = (opts["maxHands"] as? Int) ?? 2
+        let r = VNDetectHumanHandPoseRequest(); r.maximumHandCount = max(1, (opts["maxHands"] as? Int) ?? 2)
         try handler.perform([r])
         return ["hands": try (r.results ?? []).map { ["chirality": String(describing: $0.chirality), "joints": poseJSON(try $0.recognizedPoints(.all), minConf), "confidence": $0.confidence] }]
 
@@ -251,7 +262,7 @@ private func run(_ op: String, _ image: CGImage, _ opts: [String: Any]) throws -
 
     case "classify":
         let r = VNClassifyImageRequest(); try handler.perform([r])
-        let top = (opts["top"] as? Int) ?? 10
+        let top = max(0, (opts["top"] as? Int) ?? 10) // prefix() traps on a negative count and would take the whole process down
         let items = (r.results ?? []).filter { $0.confidence >= minConf }.sorted { $0.confidence > $1.confidence }.prefix(top)
         return ["labels": items.map { ["label": $0.identifier, "confidence": $0.confidence] }]
 
@@ -280,7 +291,7 @@ private func run(_ op: String, _ image: CGImage, _ opts: [String: Any]) throws -
         let r = VNDetectContoursRequest(); r.contrastAdjustment = Float((opts["contrast"] as? Double) ?? 2)
         try handler.perform([r])
         guard let o = r.results?.first else { return ["contourCount": 0, "contours": []] }
-        let maxN = (opts["max"] as? Int) ?? 50
+        let maxN = max(0, (opts["max"] as? Int) ?? 50)
         return ["contourCount": o.contourCount, "contours": o.topLevelContours.prefix(maxN).map { c in
             ["points": c.normalizedPoints.map { ["x": Double($0.x), "y": Double($0.y)] }, "children": c.childContourCount]
         }]
@@ -291,7 +302,7 @@ private func run(_ op: String, _ image: CGImage, _ opts: [String: Any]) throws -
         return ["horizon": ["angleRadians": o.angle, "angleDegrees": o.angle * 180 / .pi]]
 
     case "rectangles":
-        let r = VNDetectRectanglesRequest(); r.maximumObservations = (opts["max"] as? Int) ?? 10
+        let r = VNDetectRectanglesRequest(); r.maximumObservations = max(0, (opts["max"] as? Int) ?? 10)
         r.minimumConfidence = minConf; try handler.perform([r])
         return ["rectangles": (r.results ?? []).map { ["box": box($0.boundingBox), "confidence": $0.confidence,
             "corners": ["topLeft": pt($0.topLeft), "topRight": pt($0.topRight), "bottomRight": pt($0.bottomRight), "bottomLeft": pt($0.bottomLeft)]] }]

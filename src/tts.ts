@@ -35,10 +35,14 @@ export async function synthesize(dir: string, o: TtsOpts) {
   const out = join(dir, `speech.${ext}`);
   try {
     const { format: _f, ...rest } = o;
-    const p = Bun.spawn([TTS_BIN, JSON.stringify(rest), out], { stdout: "pipe", stderr: "pipe" });
-    const [stdout, code] = await Promise.all([new Response(p.stdout).text(), p.exited]);
+    // drain stderr too (an unread pipe that fills up blocks the child forever); the kill timeout backs up the helper's own 120 s limit
+    const p = Bun.spawn([TTS_BIN, JSON.stringify(rest), out], { stdout: "pipe", stderr: "pipe", timeout: 130_000 });
+    const [stdout, stderr, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
     let res: any;
-    try { res = JSON.parse(stdout.trim().split("\n").pop() ?? ""); } catch { res = { ok: false, error: `vision-tts exited ${code} without a result` }; }
+    try { res = JSON.parse(stdout.trim().split("\n").pop() ?? ""); } catch {
+      const detail = stderr.trim().slice(-500);
+      res = { ok: false, error: `vision-tts exited ${code} without a result${detail ? `: ${detail}` : ""}` };
+    }
     if (!res.ok) throw new Error(res.error);
     return {
       bytes: new Uint8Array(await readFile(out)), name: `speech.${ext}`, mime: ext === "m4a" ? "audio/mp4" : "audio/wav",

@@ -2,7 +2,7 @@ import { Elysia, t } from "elysia";
 import { call } from "./native";
 import { nativeAvailable, nativeError } from "./platform";
 import { checkVoice, voices } from "./tts";
-import { enqueue, findFile, getJob, listFiles, listJobs } from "./queue";
+import { enqueue, findFile, getJob, listFiles, listJobs, MAX_LIST } from "./queue";
 import { openapi } from "@elysiajs/openapi";
 import { fileURLToPath } from "node:url";
 import pkg from "../package.json";
@@ -21,10 +21,17 @@ const bytesOf = async (f: File) => new Uint8Array(await f.arrayBuffer());
 // every processing route is async: validate, enqueue, answer 202 with a job to poll at GET /jobs/:id
 const submit = async (op: string, files: File[], opts: unknown = {}) => {
   const id = await enqueue(op, await Promise.all(files.map(bytesOf)), opts);
-  return { id, status: "queued", url: `/jobs/${id}` };
+  return { id, status: "queued" as const, url: `/jobs/${id}` };
 };
 const accepted = { 202: t.Object({ id: t.String({ format: "uuid" }), status: t.Literal("queued"), url: t.String() }, { description: "Job accepted; poll GET /jobs/{id}" }) };
+const invalid = { 422: t.Object({ ok: t.Boolean(), error: t.String() }, { description: "Invalid parameter" }) };
 const d = (tag: string, summary: string, description?: string) => ({ detail: { tags: [tag], summary, description } });
+// numeric query params: undefined when absent, NaN when present but not acceptable (the route answers 422)
+const num = (v?: string) => (v === undefined || v === "" ? undefined : Number(v));
+const real = (v?: string) => { const n = num(v); return n === undefined || Number.isFinite(n) ? n : NaN; };
+const count = (v?: string) => { const n = num(v); return n === undefined || (Number.isInteger(n) && n >= 0) ? n : NaN; };
+const firstInvalid = (o: Record<string, unknown>) => Object.keys(o).find((k) => Number.isNaN(o[k]));
+const MAX_PDF_SCALE = 8; // same cap as native/vision.swift
 const imageBody = t.Object({ file: t.File({ type: "image/*" }) });
 
 const SCALAR_JS = fileURLToPath(new URL("../node_modules/@scalar/api-reference/dist/browser/standalone.js", import.meta.url));
@@ -74,16 +81,17 @@ const app = new Elysia()
     status(202, await submit("ocr", [body.file], toOpts(query))), { body: imageBody, query: textOpts, response: accepted, ...d("OCR", "Recognize text", "`fast` is quicker but does not read Thai; use `accurate` (default) for Thai. `lang` is a comma list such as `th-TH,en-US`.") })
   .post("/ocr/document", async ({ body, query, status }) =>
     status(202, await submit("document", [body.file], toOpts(query))), { body: imageBody, query: t.Object({ lang: t.Optional(t.String()) }), response: accepted, ...d("OCR", "Recognize document structure", "Tables, lists, paragraphs and title. Needs macOS 26+.") })
-  .post("/ocr/pdf", async ({ body, query, status }) =>
-    status(202, await submit("pdf", [body.file], {
-      ...toOpts(query),
-      scale: query.scale ? Number(query.scale) : undefined,
-      pages: query.pages?.split(",").map(Number).filter(Number.isInteger),
-    })), {
+  .post("/ocr/pdf", async ({ body, query, status }) => {
+    const scale = real(query.scale);
+    const pages = query.pages?.split(",").filter(Boolean).map(Number);
+    if (scale !== undefined && !(scale > 0 && scale <= MAX_PDF_SCALE)) return status(422, { ok: false, error: `scale must be > 0 and <= ${MAX_PDF_SCALE}` });
+    if (pages?.some((p) => !Number.isInteger(p) || p < 1)) return status(422, { ok: false, error: "pages must be 1-based page numbers" });
+    return status(202, await submit("pdf", [body.file], { ...toOpts(query), scale, pages }));
+  }, {
     body: t.Object({ file: t.File({ type: "application/pdf" }) }),
     query: t.Object({ ...textOpts.properties, scale: t.Optional(t.String()), pages: t.Optional(t.String()) }),
-    response: accepted,
-    ...d("OCR", "OCR a PDF", "Renders each page and recognizes text. `pages` is a 1-based comma list; `scale` is the render scale (default 2)."),
+    response: { ...accepted, ...invalid },
+    ...d("OCR", "OCR a PDF", `Renders each page and recognizes text. \`pages\` is a 1-based comma list; \`scale\` is the render scale (default 2, max ${MAX_PDF_SCALE}).`),
   })
   .post("/detect/barcode", async ({ body, status }) => status(202, await submit("barcode", [body.file])), { body: imageBody, response: accepted, ...d("Detect", "Read barcodes and QR codes") })
   .post("/image/similarity", async ({ body, status }) => status(202, await submit("similarity", [body.a, body.b])),
@@ -109,10 +117,13 @@ const app = new Elysia()
     response: { ...accepted, 422: t.Object({ ok: t.Boolean(), error: t.String() }) },
     ...d("TTS", "Text to speech", "Uses AVSpeechSynthesizer. Thai text picks a Thai voice automatically. The audio is an output file of the job: download it from `GET /jobs/{id}/files/speech.wav` (or `.m4a`) within 6 h."),
   })
-  .get("/jobs", ({ query }) => listJobs(query.status, query.limit ? Number(query.limit) : 50),
-    { query: t.Object({ status: t.Optional(t.String()), limit: t.Optional(t.String()) }), ...d("Jobs", "List jobs", "Newest first. `status` is one of queued, running, done, failed.") })
+  .get("/jobs", ({ query }) => {
+    const limit = count(query.limit);
+    return listJobs(query.status, limit ? Math.min(limit, MAX_LIST) : 50); // missing, 0 or invalid → default
+  }, { query: t.Object({ status: t.Optional(t.String()), limit: t.Optional(t.String()) }), ...d("Jobs", "List jobs", `Newest first. \`status\` is one of queued, running, done, failed. \`limit\` defaults to 50, max ${MAX_LIST}.`) })
   .get("/jobs/:id", async ({ params, query, status }) => {
-    const job = await getJob(params.id, Math.min(Number(query.wait ?? 0), 30_000));
+    const wait = real(query.wait) ?? 0;
+    const job = await getJob(params.id, wait > 0 ? Math.min(wait, 30_000) : 0); // NaN/negative → no wait
     return job ?? status(404, { ok: false, error: "job not found" });
   }, { params: t.Object({ id: t.String({ format: "uuid" }) }), query: t.Object({ wait: t.Optional(t.String()) }), ...d("Jobs", "Get a job", "`status` goes queued → running → done | failed. Results are kept for 24 h. `wait` (ms, max 30000) long-polls until the job finishes.") })
   .get("/jobs/:id/files", ({ params }) => listFiles(params.id), {
@@ -151,14 +162,18 @@ const SUMMARY: Record<string, [string, string]> = {
   classify: ["Image", "Classify the image (`top`, `minConfidence`)"], saliency: ["Image", "Saliency regions (`type=attention|objectness`, `heatmap=true`)"],
   mask: ["Image", "Foreground mask, or `type=person`; returns a base64 grayscale PNG"], featureprint: ["Image", "Feature-print size (embedding)"],
 };
-const num = (v?: string) => (v === undefined || v === "" ? undefined : Number(v));
 for (const [path, op] of Object.entries(RUN)) {
-  app.post(path, async ({ body, query, status }) => status(202, await submit(`run:${op}`, [body.file], {
-    minConfidence: num(query.minConfidence), top: num(query.top), max: num(query.max), maxHands: num(query.maxHands),
-    contrast: num(query.contrast), type: query.type, heatmap: query.heatmap === "true", upperBodyOnly: query.upperBodyOnly === "true",
-  })), {
+  app.post(path, async ({ body, query, status }) => {
+    const opts = {
+      minConfidence: real(query.minConfidence), top: count(query.top), max: count(query.max), maxHands: count(query.maxHands),
+      contrast: real(query.contrast), type: query.type, heatmap: query.heatmap === "true", upperBodyOnly: query.upperBodyOnly === "true",
+    };
+    const bad = firstInvalid(opts);
+    if (bad) return status(422, { ok: false, error: `invalid ${bad}: ${query[bad as keyof typeof query]}` });
+    return status(202, await submit(`run:${op}`, [body.file], opts));
+  }, {
     body: imageBody,
-    response: accepted,
+    response: { ...accepted, ...invalid },
     ...d(...SUMMARY[op]),
     query: t.Object({
       minConfidence: t.Optional(t.String()), top: t.Optional(t.String()), max: t.Optional(t.String()), maxHands: t.Optional(t.String()),

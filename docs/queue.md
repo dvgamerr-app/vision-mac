@@ -14,7 +14,9 @@ client ─POST /ocr/text─► Elysia ─┬─ insert vision_jobs (status=queue
 
 - **pgque** ([NikolayS/pgque](https://github.com/NikolayS/pgque), Apache-2.0, PgQ แบบ pure SQL) เก็บแค่ event `{id}` ส่วนผลลัพธ์อยู่ในตาราง `vision_jobs`
 - ติดตั้งแบบ pure SQL ไม่ใช้ extension (ไฟล์ vendor ไว้ที่ `db/pgque.sql` จาก commit `4a52258`, license ที่ `db/pgque.LICENSE`)
-- **ไม่มี pg_cron** ใน `postgres:18-alpine` ตัว server เลยเรียก `pgque.ticker()` ทุก 1 วินาที และ `pgque.maint()` ทุก 30 วินาทีเอง ห้ามรันหลาย instance พร้อมกัน
+- **ไม่มี pg_cron** ใน `postgres:18-alpine` ตัว server เลยขับ pgque เอง ห้ามรันหลาย instance พร้อมกัน
+  - `pgque.ticker()` ทุก 1 วินาที และตอน enqueue ทุก tick ในโปรเซสวิ่งผ่าน chain เดียว ไม่ทับกัน (pgque เตือนว่า ticker ขนานกันทำให้ event ซ้ำได้)
+  - ทุก 30 วินาที: `pgque.maint()` แล้วตามด้วย `pgque.maint_retry_events()` (วนจนได้ 0) และ `pgque.maint_rotate_tables_step2()` แยกกันคนละ statement เพราะ `maint()` ไม่รวมสองตัวนี้ (ปกติ `pgque.start()` ตั้งผ่าน pg_cron) ถ้าขาด retry จะไม่กลับเข้า queue และตาราง event จะหยุด rotate หลังรอบแรก
 
 ## ฐานข้อมูล
 
@@ -35,6 +37,9 @@ schema ทั้งหมดจัดการด้วย Kysely migration ใ�
 | `001_pgque` | ติดตั้ง pgque จาก `db/pgque.sql` (ข้ามถ้ามี `pgque.queue` อยู่แล้ว) |
 | `002_queue` | `create_queue('vision')` + `subscribe('vision','vision-worker')` |
 | `003_jobs` | ตาราง `vision_jobs`, `vision_files` + index |
+| `004_pgque_revoke` | ถอนสิทธิ์ SELECT ที่ pgque ให้ `PUBLIC` ไว้บนตาราง/sequence ใน schema `pgque` (payload คือ job id ซึ่งเป็นกุญแจดาวน์โหลดไฟล์) |
+
+- `001_pgque` ต้องใช้ user ที่มี `CREATEROLE` (pgque สร้าง role `pgque_reader`/`pgque_writer`/`pgque_admin`) superuser ของ `compose.yaml` มีอยู่แล้ว ถ้าไม่มีสิทธิ์ migration จะหยุดพร้อมบอกเหตุผลก่อนเริ่มติดตั้ง
 
 - รันอัตโนมัติตอน server start (`AUTO_MIGRATE=false` เพื่อปิด) หรือด้วยมือ `bun run migrate [up|down|status]`
 - ทุกขั้น idempotent จึงใช้กับ DB ที่ติดตั้งด้วยมือมาก่อนได้ (Kysely แค่จดประวัติใน `kysely_migration`)
@@ -57,7 +62,7 @@ bun run db:down    # หยุด (เพิ่ม -v เพื่อลบข�
 |---|---|
 | `POST /ocr/*`, `/detect/*`, `/image/*` | validate แล้ว `202 {id, status:"queued", url}` |
 | `GET /jobs/:id?wait=<ms>` | long-poll ได้สูงสุด 30000 ms; `status` = `queued` → `running` → `done` \| `failed`; ผลอยู่ใน `result`, ความผิดพลาดใน `error` |
-| `GET /jobs?status=&limit=` | ดู job ล่าสุด |
+| `GET /jobs?status=&limit=` | ดู job ล่าสุด (`limit` ดีฟอลต์ 50 สูงสุด 200) |
 | `POST /tts` | JSON `{text, voice?, rate?, format?}` → job; เสียงออกมาเป็นไฟล์ `speech.wav` / `speech.m4a` ของ job (ดูหัวข้อ TTS) |
 | `GET /voices` | เสียงที่ติดตั้งในเครื่อง พร้อม identifier/quality/gender (sync) |
 | `GET /jobs/:id/files` | รายการไฟล์ผลลัพธ์ของ job (`name`, `mime`, `size`, `url`, `expiresAt`, `expired`) |
@@ -89,9 +94,11 @@ bun run db:down    # หยุด (เพิ่ม -v เพื่อลบข�
 
 ## พฤติกรรมที่ต้องรู้
 
-- **Vision error = ล้มทันที ไม่ retry** (เช่น decode ภาพไม่ได้) job เป็น `failed` พร้อม `error` ส่วน error ฝั่ง infra (DB, worker) จะ throw ให้ pgque `nack` แล้ว retry หลัง 30 วินาที เกินจำนวนที่ queue กำหนดจะเข้า DLQ
-- ไฟล์ input ถูกลบเมื่อ job จบ
-- job ที่ค้างเกิน `STUCK_MINUTES` (10) ถูกตีเป็น `failed`
+- **Vision error = ล้มทันที ไม่ retry** (เช่น decode ภาพไม่ได้) job เป็น `failed` พร้อม `error` ส่วน error ฝั่ง infra (DB, อ่านไฟล์ input) จะ throw ให้ pgque `nack` แล้ว retry หลัง 30 วินาที เกิน `queue_max_retries` (ดีฟอลต์ 5) จะเข้า DLQ (`pgque.dlq_inspect`)
+- native call ที่นานเกิน `NATIVE_TIMEOUT_MS` (300000) หรือ worker ที่ error/ปิดตัว ตอบ `ok:false` (job `failed`) แล้ว worker ตัวนั้นถูกปลด ตัวใหม่เริ่มเมื่อมี call ถัดไป queue จึงไม่ค้างเพราะ job เดียว
+- ไฟล์ input ถูกลบเมื่อ job จบ หรือเมื่อ job ถูกข้าม/ถูกตีว่าค้าง
+- job ที่ `running` นานเกิน `STUCK_MINUTES` (10, นับจาก `started_at`) ถูกตีเป็น `failed` และผลที่มาทีหลังจะไม่ทับสถานะนั้น job ที่รอคิวอยู่ไม่โดน ยกเว้นค้าง `queued` เกิน `RETENTION_HOURS` (ถือว่า event หาย)
+- `enqueue` insert แถว job และ `pgque.send` ใน transaction เดียว ถ้า send ล้มจะไม่เหลือแถว/ไฟล์ค้าง
 - consumer ประมวลผลทีละ job ต่อ 1 โปรเซส (Worker pool 2 ตัวถูกใช้ทีละตัว) ถ้าต้องการขนาน ต้องเพิ่ม cooperative consumer (ฟีเจอร์ experimental ของ pgque)
 - latency ต่ำสุดราว 0.6 วินาที (poll 500 ms) งานหนักกว่านั้นขึ้นกับ Vision
 

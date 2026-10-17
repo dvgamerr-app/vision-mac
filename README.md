@@ -8,10 +8,10 @@ bun install
 cp .env.example .env   # DATABASE_URL, matches compose.yaml
 bun run db:up          # local Postgres 18 via docker compose (or point DATABASE_URL at your own)
 bun run build:native   # swiftc → native/libvision.dylib + native/vision-tts (macOS only; skipped elsewhere)
-bun run start          # PORT=8090 WORKERS=2; applies migrations on start
+bun run start          # PORT=8090 WORKERS=2 NATIVE_TIMEOUT_MS=300000; applies migrations on start
 ```
 
-**Migrations** use [Kysely](https://kysely.dev) (`src/migrations/`): pgque install → queue `vision` → tables `vision_jobs`/`vision_files`. They run automatically on start (`AUTO_MIGRATE=false` to turn off) or by hand: `bun run migrate [up|down|status]`. They are idempotent, so a database set up by hand before migrations existed is adopted as-is.
+**Migrations** use [Kysely](https://kysely.dev) (`src/migrations/`): pgque install → queue `vision` → tables `vision_jobs`/`vision_files` → revoke pgque's PUBLIC read grants. Installing pgque needs a user with CREATEROLE (it creates `pgque_reader`/`pgque_writer`/`pgque_admin`); the compose superuser has it. They run automatically on start (`AUTO_MIGRATE=false` to turn off) or by hand: `bun run migrate [up|down|status]`. They are idempotent, so a database set up by hand before migrations existed is adopted as-is.
 
 **Not on macOS** (Windows/Linux dev machines): the app still starts. DB, migrations, queue, job/file routes and `/docs` all work, so you can develop and test them; `GET /` shows `native.available: false` with the reason, `/voices` and `/capabilities` answer `501`, and every processing job (OCR, TTS, ...) ends `failed` with `Vision and AVSpeechSynthesizer need macOS`. Same if the dylib was never built.
 
@@ -23,7 +23,7 @@ After changing Swift: `bun run build:native && launchctl kickstart -k gui/$(id -
 | `GET /health`, `GET /capabilities` | | OS version, OCR languages |
 | `POST /ocr/text` | `file` (image) | `?level=fast\|accurate&lang=th-TH,en-US&correction=false` — `fast` loses Thai |
 | `POST /ocr/document` | `file` (image) | tables, lists, paragraphs, title (macOS 26+) |
-| `POST /ocr/pdf` | `file` (pdf) | text options + `?pages=1,2&scale=2` |
+| `POST /ocr/pdf` | `file` (pdf) | text options + `?pages=1,2&scale=2` (scale > 0, max 8) |
 | `POST /detect/barcode` | `file` (image) | QR / barcodes |
 | `POST /detect/face` | `file` | boxes, landmarks (relative to face box), pose angles, capture quality |
 | `POST /detect/human` `/body` `/hand` `/animal` | `file` | `?minConfidence=0.1`; hand: `?maxHands=2`; human: `?upperBodyOnly=true`; animal = cats/dogs only |
@@ -40,6 +40,6 @@ After changing Swift: `bun run build:native && launchctl kickstart -k gui/$(id -
 | `GET /jobs/:id`, `GET /jobs` | | job status/result; `?wait=ms` long-polls |
 | `GET /jobs/:id/files`, `GET /jobs/:id/files/:name` | | output files (images, later audio/video); stored in `storage/`, TTL 6 h after the job finishes (`FILE_TTL_HOURS`), `410` when expired |
 
-**All processing routes are async**: they return `202 {id, status, url}`; fetch the result with `GET /jobs/:id?wait=20000` (see `../docs/vision-mac-queue.md`). Needs `DATABASE_URL` in `.env` (db `vision`, pgque installed from `db/`).
+**All processing routes are async**: they return `202 {id, status, url}`; fetch the result with `GET /jobs/:id?wait=20000` (see [docs/queue.md](docs/queue.md)). Needs `DATABASE_URL` in `.env` (db `vision`, pgque installed from `db/`).
 
 Boxes are normalized 0–1, origin bottom-left. Example: `fetch(url, { method: "POST", body: formData })` with field `file`.
