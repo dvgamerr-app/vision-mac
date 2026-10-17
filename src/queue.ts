@@ -19,6 +19,16 @@ const STUCK_MINUTES = Number(process.env.STUCK_MINUTES ?? 10);
 if (!process.env.DATABASE_URL) throw new Error("DATABASE_URL is required (see .env.example)");
 const client = await connect(process.env.DATABASE_URL);
 const db = client.rawPool;
+// One instance per database: two consumers on queue `vision` (or two tickers) would double-process jobs. The lock lives on a
+// dedicated connection for the whole life of the process, so it frees itself when the process dies or the connection drops.
+const lockConn = await db.connect();
+const { rows: [lock] } = await lockConn.query("select pg_try_advisory_lock(hashtext('vision-mac')) as ok");
+if (!lock.ok) {
+  console.error("another vision-mac instance is already running against this database (advisory lock held); exiting");
+  process.exit(1);
+}
+lockConn.on("error", (e) => { console.error("lock connection lost:", e.message); process.exit(1); }); // let the supervisor restart us
+
 if (process.env.AUTO_MIGRATE !== "false") await migrate(db); // pgque, queue and tables (src/migrations); `bun run migrate` does the same by hand
 await mkdir(JOBS_DIR, { recursive: true });
 await mkdir(STORAGE_DIR, { recursive: true });

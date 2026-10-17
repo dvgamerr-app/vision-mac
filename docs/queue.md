@@ -14,7 +14,7 @@ client ─POST /ocr/text─► Elysia ─┬─ insert vision_jobs (status=queue
 
 - **pgque** ([NikolayS/pgque](https://github.com/NikolayS/pgque), Apache-2.0, PgQ แบบ pure SQL) เก็บแค่ event `{id}` ส่วนผลลัพธ์อยู่ในตาราง `vision_jobs`
 - ติดตั้งแบบ pure SQL ไม่ใช้ extension (ไฟล์ vendor ไว้ที่ `db/pgque.sql` จาก commit `4a52258`, license ที่ `db/pgque.LICENSE`)
-- **ไม่มี pg_cron** ใน `postgres:18-alpine` ตัว server เลยขับ pgque เอง ห้ามรันหลาย instance พร้อมกัน
+- **ไม่มี pg_cron** ใน `postgres:18-alpine` ตัว server เลยขับ pgque เอง ห้ามรันหลาย instance พร้อมกัน — ตอน start โค้ดจะขอ advisory lock (`pg_try_advisory_lock(hashtext('vision-mac'))`) ถ้ามี instance อื่นถืออยู่ ตัวใหม่จะแจ้งแล้ว `exit(1)` ก่อนแตะ queue (lock หลุดเองเมื่อโปรเซสหรือ connection ตาย)
   - `pgque.ticker()` ทุก 1 วินาที และตอน enqueue ทุก tick ในโปรเซสวิ่งผ่าน chain เดียว ไม่ทับกัน (pgque เตือนว่า ticker ขนานกันทำให้ event ซ้ำได้)
   - ทุก 30 วินาที: `pgque.maint()` แล้วตามด้วย `pgque.maint_retry_events()` (วนจนได้ 0) และ `pgque.maint_rotate_tables_step2()` แยกกันคนละ statement เพราะ `maint()` ไม่รวมสองตัวนี้ (ปกติ `pgque.start()` ตั้งผ่าน pg_cron) ถ้าขาด retry จะไม่กลับเข้า queue และตาราง event จะหยุด rotate หลังรอบแรก
 
