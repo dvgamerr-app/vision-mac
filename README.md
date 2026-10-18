@@ -15,6 +15,8 @@ bun run start          # PORT=8090 WORKERS=2 NATIVE_TIMEOUT_MS=300000; applies m
 
 **Not on macOS** (Windows/Linux dev machines): the app still starts. DB, migrations, queue, job/file routes and `/docs` all work, so you can develop and test them; `GET /` shows `native.available: false` with the reason, `/voices` and `/capabilities` answer `501`, and every processing job (OCR, TTS, ...) ends `failed` with `Vision and AVSpeechSynthesizer need macOS`. Same if the dylib was never built.
 
+**Traceway** ([src/telemetry.ts](src/telemetry.ts)): set `TRACEWAY_URL` and `TRACEWAY_TOKEN` (project ingest token) in `.env`; without both it is a no-op. Each request is a SERVER span (send `x-trace-parrent: 00-<trace>-<span>-01` to continue a caller's trace), each job a `job:<op>` Task in the same trace, and each native call a `gen_ai.*` span under **AI Traces** (model = the Apple API, cost 0). Tokens are what an LLM would bill for the same request: text and the result JSON with the o200k tokenizer, images with the high-detail tile formula (PDF pages counted as US Letter at the render scale). Prompt/completion carry metadata only (options, sizes, result keys, text length), never the recognized text or audio. `console.log/warn/error` are mirrored as logs.
+
 Service: `~/Library/LaunchAgents/app.dvgamerr.vision-mac.plist` (log: `/tmp/vision-mac.log`).
 After changing Swift: `bun run build:native && launchctl kickstart -k gui/$(id -u)/app.dvgamerr.vision-mac`
 

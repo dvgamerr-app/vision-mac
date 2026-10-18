@@ -14,8 +14,17 @@
   },
   "dependencies": {
     "@elysiajs/openapi": "^1.4.16",
+    "@opentelemetry/api": "^1.9.1",
+    "@opentelemetry/api-logs": "^0.223.0",
+    "@opentelemetry/exporter-logs-otlp-http": "^0.223.0",
+    "@opentelemetry/exporter-trace-otlp-http": "^0.223.0",
+    "@opentelemetry/resources": "^2.12.0",
+    "@opentelemetry/sdk-logs": "^0.223.0",
+    "@opentelemetry/sdk-trace-base": "^2.12.0",
     "@scalar/api-reference": "^1.74.0",
     "elysia": "^1.4.30",
+    "gpt-tokenizer": "^4.0.4",
+    "image-size": "^2.0.4",
     "kysely": "^0.29.6",
     "pg": "^8.23.1",
     "pgque": "^0.2.2"

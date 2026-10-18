@@ -3,6 +3,7 @@ import { call } from "./native";
 import { nativeAvailable, nativeError } from "./platform";
 import { checkVoice, voices } from "./tts";
 import { enqueue, findFile, getJob, listFiles, listJobs, MAX_LIST } from "./queue";
+import { requestTelemetry, requestTrace } from "./telemetry";
 import { openapi } from "@elysiajs/openapi";
 import { fileURLToPath } from "node:url";
 import pkg from "../package.json";
@@ -19,8 +20,8 @@ const toOpts = (q: { level?: string; lang?: string; correction?: string }) => ({
 });
 const bytesOf = async (f: File) => new Uint8Array(await f.arrayBuffer());
 // every processing route is async: validate, enqueue, answer 202 with a job to poll at GET /jobs/:id
-const submit = async (op: string, files: File[], opts: unknown = {}) => {
-  const id = await enqueue(op, await Promise.all(files.map(bytesOf)), opts);
+const submit = async (request: Request, op: string, files: File[], opts: unknown = {}) => {
+  const id = await enqueue(op, await Promise.all(files.map(bytesOf)), opts, requestTrace(request));
   return { id, status: "queued" as const, url: `/jobs/${id}` };
 };
 const accepted = { 202: t.Object({ id: t.String({ format: "uuid" }), status: t.Literal("queued"), url: t.String() }, { description: "Job accepted; poll GET /jobs/{id}" }) };
@@ -37,6 +38,7 @@ const imageBody = t.Object({ file: t.File({ type: "image/*" }) });
 const SCALAR_JS = fileURLToPath(new URL("../node_modules/@scalar/api-reference/dist/browser/standalone.js", import.meta.url));
 
 const app = new Elysia()
+  .use(requestTelemetry)
   .use(openapi({
     path: "/docs",
     specPath: "/docs/json",
@@ -77,30 +79,30 @@ const app = new Elysia()
     const r = await call("capabilities");
     return r.ok ? r : status(501, r);
   }, d("System", "Capabilities", "OS version and supported OCR languages."))
-  .post("/ocr/text", async ({ body, query, status }) =>
-    status(202, await submit("ocr", [body.file], toOpts(query))), { body: imageBody, query: textOpts, response: accepted, ...d("OCR", "Recognize text", "`fast` is quicker but does not read Thai; use `accurate` (default) for Thai. `lang` is a comma list such as `th-TH,en-US`.") })
-  .post("/ocr/document", async ({ body, query, status }) =>
-    status(202, await submit("document", [body.file], toOpts(query))), { body: imageBody, query: t.Object({ lang: t.Optional(t.String()) }), response: accepted, ...d("OCR", "Recognize document structure", "Tables, lists, paragraphs and title. Needs macOS 26+.") })
-  .post("/ocr/pdf", async ({ body, query, status }) => {
+  .post("/ocr/text", async ({ body, query, status, request }) =>
+    status(202, await submit(request, "ocr", [body.file], toOpts(query))), { body: imageBody, query: textOpts, response: accepted, ...d("OCR", "Recognize text", "`fast` is quicker but does not read Thai; use `accurate` (default) for Thai. `lang` is a comma list such as `th-TH,en-US`.") })
+  .post("/ocr/document", async ({ body, query, status, request }) =>
+    status(202, await submit(request, "document", [body.file], toOpts(query))), { body: imageBody, query: t.Object({ lang: t.Optional(t.String()) }), response: accepted, ...d("OCR", "Recognize document structure", "Tables, lists, paragraphs and title. Needs macOS 26+.") })
+  .post("/ocr/pdf", async ({ body, query, status, request }) => {
     const scale = real(query.scale);
     const pages = query.pages?.split(",").filter(Boolean).map(Number);
     if (scale !== undefined && !(scale > 0 && scale <= MAX_PDF_SCALE)) return status(422, { ok: false, error: `scale must be > 0 and <= ${MAX_PDF_SCALE}` });
     if (pages?.some((p) => !Number.isInteger(p) || p < 1)) return status(422, { ok: false, error: "pages must be 1-based page numbers" });
-    return status(202, await submit("pdf", [body.file], { ...toOpts(query), scale, pages }));
+    return status(202, await submit(request, "pdf", [body.file], { ...toOpts(query), scale, pages }));
   }, {
     body: t.Object({ file: t.File({ type: "application/pdf" }) }),
     query: t.Object({ ...textOpts.properties, scale: t.Optional(t.String()), pages: t.Optional(t.String()) }),
     response: { ...accepted, ...invalid },
     ...d("OCR", "OCR a PDF", `Renders each page and recognizes text. \`pages\` is a 1-based comma list; \`scale\` is the render scale (default 2, max ${MAX_PDF_SCALE}).`),
   })
-  .post("/detect/barcode", async ({ body, status }) => status(202, await submit("barcode", [body.file])), { body: imageBody, response: accepted, ...d("Detect", "Read barcodes and QR codes") })
-  .post("/image/similarity", async ({ body, status }) => status(202, await submit("similarity", [body.a, body.b])),
+  .post("/detect/barcode", async ({ body, status, request }) => status(202, await submit(request, "barcode", [body.file])), { body: imageBody, response: accepted, ...d("Detect", "Read barcodes and QR codes") })
+  .post("/image/similarity", async ({ body, status, request }) => status(202, await submit(request, "similarity", [body.a, body.b])),
     { body: t.Object({ a: t.File({ type: "image/*" }), b: t.File({ type: "image/*" }) }), response: accepted, ...d("Image", "Compare two images", "Feature-print distance: 0 means identical, larger means less similar.") })
   .get("/voices", async ({ status }) => nativeAvailable ? voices() : status(501, { ok: false, error: nativeError }), d("System", "List TTS voices", "Voices installed on this Mac. Pass `name` (or its short form, e.g. `Kanya`) as `voice` to POST /tts."))
-  .post("/tts", async ({ body, status }) => {
+  .post("/tts", async ({ body, status, request }) => {
     const bad = await checkVoice(body);
     if (bad) return status(422, { ok: false, error: bad });
-    const id = await enqueue("tts", [], body);
+    const id = await enqueue("tts", [], body, requestTrace(request));
     return status(202, { id, status: "queued" as const, url: `/jobs/${id}` });
   }, {
     body: t.Object({
@@ -163,14 +165,14 @@ const SUMMARY: Record<string, [string, string]> = {
   mask: ["Image", "Foreground mask, or `type=person`; returns a base64 grayscale PNG"], featureprint: ["Image", "Feature-print size (embedding)"],
 };
 for (const [path, op] of Object.entries(RUN)) {
-  app.post(path, async ({ body, query, status }) => {
+  app.post(path, async ({ body, query, status, request }) => {
     const opts = {
       minConfidence: real(query.minConfidence), top: count(query.top), max: count(query.max), maxHands: count(query.maxHands),
       contrast: real(query.contrast), type: query.type, heatmap: query.heatmap === "true", upperBodyOnly: query.upperBodyOnly === "true",
     };
     const bad = firstInvalid(opts);
     if (bad) return status(422, { ok: false, error: `invalid ${bad}: ${query[bad as keyof typeof query]}` });
-    return status(202, await submit(`run:${op}`, [body.file], opts));
+    return status(202, await submit(request, `run:${op}`, [body.file], opts));
   }, {
     body: imageBody,
     response: { ...accepted, ...invalid },

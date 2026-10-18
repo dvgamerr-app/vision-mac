@@ -5,6 +5,7 @@ import * as m001 from "./migrations/001_pgque";
 import * as m002 from "./migrations/002_queue";
 import * as m003 from "./migrations/003_jobs";
 import * as m004 from "./migrations/004_pgque_revoke";
+import * as m005 from "./migrations/005_job_trace";
 
 // Migrations are listed here (not read from disk) so they work the same under bun, on Windows and in a bundle. Add new ones at the end.
 const migrations: Record<string, Migration> = {
@@ -12,6 +13,7 @@ const migrations: Record<string, Migration> = {
   "002_queue": m002,
   "003_jobs": m003,
   "004_pgque_revoke": m004,
+  "005_job_trace": m005,
 };
 
 function migrator(pool: pg.Pool) {

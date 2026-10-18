@@ -6,6 +6,7 @@ import { mkdir, rm, readFile, writeFile, rmdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { call } from "./native";
 import { synthesize, type TtsOpts } from "./tts";
+import { aiSpan, runTask, shutdownTelemetry, type AiResult } from "./telemetry";
 
 // Jobs: pgque carries the event (job id), `vision_jobs` holds input paths + result. See docs/queue.md.
 const QUEUE = "vision";
@@ -39,7 +40,8 @@ let ticking: Promise<unknown> = Promise.resolve();
 const tick = (label: string, fn: () => Promise<unknown>) =>
   (ticking = ticking.then(fn).catch((e) => console.error(`${label}:`, (e as Error).message)));
 
-export async function enqueue(op: string, files: Uint8Array[], opts: unknown = {}) {
+/** `trace` is the queuing request's traceparent (see telemetry.ts), so the job's spans continue that trace */
+export async function enqueue(op: string, files: Uint8Array[], opts: unknown = {}, trace: string | null = null) {
   const id = crypto.randomUUID();
   const dir = join(JOBS_DIR, id);
   await mkdir(dir, { recursive: true });
@@ -49,7 +51,7 @@ export async function enqueue(op: string, files: Uint8Array[], opts: unknown = {
     const c = await db.connect();
     try {
       await c.query("begin");
-      await c.query("insert into vision_jobs (id, op, opts, files) values ($1, $2, $3, $4)", [id, op, JSON.stringify(opts), paths]);
+      await c.query("insert into vision_jobs (id, op, opts, files, trace) values ($1, $2, $3, $4, $5)", [id, op, JSON.stringify(opts), paths, trace]);
       await c.query("select pgque.send($1, $2, $3::jsonb)", [QUEUE, "job", JSON.stringify({ id })]);
       await c.query("commit");
     } catch (e) {
@@ -154,25 +156,31 @@ const consumer = client.newConsumer(QUEUE, CONSUMER, { pollInterval: 500, retryA
 consumer.handle("job", async (msg) => {
   const { id } = JSON.parse(msg.payload) as { id: string };
   const { rows } = await db.query(
-    "update vision_jobs set status = 'running', attempts = attempts + 1, started_at = now() where id = $1 and status in ('queued', 'running') returning op, opts, files", [id]);
+    "update vision_jobs set status = 'running', attempts = attempts + 1, started_at = now() where id = $1 and status in ('queued', 'running') returning op, opts, files, trace", [id]);
   if (!rows[0]) { // finished, expired or deleted: drop any inputs still on disk, ack and move on
     await rm(join(JOBS_DIR, id), { recursive: true, force: true });
     return;
   }
-  const { op, opts, files } = rows[0] as { op: string; opts: unknown; files: string[] };
-  if (op === "tts") { // no input file: synthesize, store the audio as an output file
-    try {
-      const a = await synthesize(join(JOBS_DIR, id), opts as TtsOpts);
-      const file = await saveFile(id, a.name, a.mime, a.bytes);
-      await finish(id, "done", { ...a.info, file });
-    } catch (e) { await finish(id, "failed", undefined, (e as Error).message); }
-    return;
-  }
-  const bytes = await Promise.all(files.map(async (f) => new Uint8Array(await readFile(f))));
-  const res = await call(op, bytes[0], opts, bytes[1]);
-  // a Vision error (bad image, unsupported OS) is final; only infra errors above throw and get retried by pgque
-  if (res.ok) await finish(id, "done", { ...(await externalizeFiles(id, res.result)), durationMs: res.durationMs });
-  else await finish(id, "failed", undefined, res.error ?? "unknown error");
+  const { op, opts, files, trace } = rows[0] as { op: string; opts: unknown; files: string[]; trace: string | null };
+  // Traceway: a `job:<op>` Task span, and inside it the native call as a gen_ai.* AI span
+  await runTask(`job:${op.replace(/^run:/, "")}`, trace, async (span) => {
+    if (op === "tts") { // no input file: synthesize, store the audio as an output file
+      try {
+        let audio: Awaited<ReturnType<typeof synthesize>> | undefined;
+        const res = await aiSpan(span, { op, jobId: id, opts, files: [] }, () => synthesize(join(JOBS_DIR, id), opts as TtsOpts)
+          .then((a): AiResult => { audio = a; return { ok: true, result: a.info }; }, (e): AiResult => ({ ok: false, error: (e as Error).message })));
+        if (!res.ok || !audio) return await finish(id, "failed", undefined, res.error);
+        const file = await saveFile(id, audio.name, audio.mime, audio.bytes);
+        await finish(id, "done", { ...audio.info, file });
+      } catch (e) { await finish(id, "failed", undefined, (e as Error).message); }
+      return;
+    }
+    const bytes = await Promise.all(files.map(async (f) => new Uint8Array(await readFile(f))));
+    const res = await aiSpan(span, { op, jobId: id, opts, files: bytes }, () => call(op, bytes[0], opts, bytes[1]));
+    // a Vision error (bad image, unsupported OS) is final; only infra errors above throw and get retried by pgque
+    if (res.ok) await finish(id, "done", { ...(await externalizeFiles(id, res.result)), durationMs: res.durationMs });
+    else await finish(id, "failed", undefined, res.error ?? "unknown error");
+  }, { "job.id": id });
 });
 
 await sweepFiles().catch((e) => console.error("sweep:", e.message)); // expire anything that lapsed while the service was down
@@ -208,4 +216,4 @@ setInterval(async () => {
   } catch (e) { console.error("maint:", (e as Error).message); }
 }, 30_000);
 
-process.on("SIGTERM", () => { ac.abort(); setTimeout(() => process.exit(0), 500); });
+process.on("SIGTERM", () => { ac.abort(); shutdownTelemetry().finally(() => setTimeout(() => process.exit(0), 500)); });
