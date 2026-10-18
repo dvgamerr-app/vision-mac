@@ -18,7 +18,8 @@ bun run start          # PORT=8090 WORKERS=2 NATIVE_TIMEOUT_MS=300000; applies m
 **Traceway** ([src/telemetry.ts](src/telemetry.ts)): set `TRACEWAY_URL` and `TRACEWAY_TOKEN` (project ingest token) in `.env`; without both it is a no-op. Each request is a SERVER span (send `x-trace-parrent: 00-<trace>-<span>-01` to continue a caller's trace), each job a `job:<op>` Task in the same trace, and each native call a `gen_ai.*` span under **AI Traces** (model = the Apple API, cost 0). Tokens are what an LLM would bill for the same request: text and the result JSON with the o200k tokenizer, images with the high-detail tile formula (PDF pages counted as US Letter at the render scale). Prompt/completion carry metadata only (options, sizes, result keys, text length), never the recognized text or audio. `console.log/warn/error` are mirrored as logs.
 
 Service: `~/Library/LaunchAgents/app.dvgamerr.vision-mac.plist` (log: `/tmp/vision-mac.log`).
-After changing Swift: `bun run build:native && launchctl kickstart -k gui/$(id -u)/app.dvgamerr.vision-mac`
+Update (on the Mac, or `ssh mac-m4 '~/Github/vision-mac/scripts/updater.sh'`): `./scripts/updater.sh` pulls, runs `bun install`, rebuilds the native code only when `native/` changed (`FORCE_NATIVE=1` to force), restarts the LaunchAgent and waits for `/health`. It refuses to run over local edits.
+By hand after changing Swift: `bun run build:native && launchctl kickstart -k gui/$(id -u)/app.dvgamerr.vision-mac`
 
 | Route | Body | Notes |
 |---|---|---|
